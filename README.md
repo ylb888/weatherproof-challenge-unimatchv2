@@ -90,12 +90,13 @@ The task uses 10 classes:
 
 ## Pretrained Encoder
 
-Download the DINOv2 encoder weight and place it under `pretrained/`.
+[DINOv2-Small](https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth) | [DINOv2-Base](https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth) | [DINOv2-Large](https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth)
 
-For DINOv2-Base, use:
-
-```text
-pretrained/dinov2_vitb14_pretrain.pth
+```
+├── ./pretrained
+    ├── dinov2_small.pth
+    ├── dinov2_base.pth
+    └── dinov2_large.pth
 ```
 
 ## Training
@@ -138,6 +139,8 @@ sh scripts/train_weatherproof_supervised.sh <GPU_NUM> <PORT>
 ```
 
 ## Inference
+
+[Download our model weights: DINOv2-Base](https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth) 
 
 Run inference on `data/test_input`:
 
