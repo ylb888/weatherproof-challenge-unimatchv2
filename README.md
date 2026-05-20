@@ -140,7 +140,7 @@ sh scripts/train_weatherproof_supervised.sh <GPU_NUM> <PORT>
 
 ## Inference
 
-[Download our model weights: DINOv2-Base](https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth) 
+[Download our model weights: DINOv2-Base](https://drive.google.com/file/d/1uCKmJpX3fHkHtHLyWpkI37Lf_zJVmsUi/view?usp=drive_link) 
 
 Run inference on `data/test_input`:
 
