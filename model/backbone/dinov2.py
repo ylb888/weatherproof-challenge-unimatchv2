@@ -196,13 +196,22 @@ class DinoVisionTransformer(nn.Module):
         
         sqrt_N = math.sqrt(N)
         sx, sy = float(w0) / sqrt_N, float(h0) / sqrt_N
-        patch_pos_embed = nn.functional.interpolate(
-            patch_pos_embed.reshape(1, int(sqrt_N), int(sqrt_N), dim).permute(0, 3, 1, 2),
+        patch_pos_embed = patch_pos_embed.reshape(1, int(sqrt_N), int(sqrt_N), dim).permute(0, 3, 1, 2)
+        interpolate_kwargs = dict(
             scale_factor=(sx, sy),
             # (int(w0), int(h0)), # to solve the upsampling shape issue
             mode="bicubic",
-            antialias=self.interpolate_antialias
         )
+        try:
+            patch_pos_embed = nn.functional.interpolate(
+                patch_pos_embed,
+                antialias=self.interpolate_antialias,
+                **interpolate_kwargs,
+            )
+        except TypeError as exc:
+            if "antialias" not in str(exc):
+                raise
+            patch_pos_embed = nn.functional.interpolate(patch_pos_embed, **interpolate_kwargs)
         
         assert int(w0) == patch_pos_embed.shape[-2]
         assert int(h0) == patch_pos_embed.shape[-1]

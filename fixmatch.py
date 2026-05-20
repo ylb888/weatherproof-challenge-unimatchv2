@@ -25,7 +25,10 @@ parser = argparse.ArgumentParser(description='Reproduced FixMatch with an EMA Te
 parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--labeled-id-path', type=str, required=True)
 parser.add_argument('--unlabeled-id-path', type=str, required=True)
+parser.add_argument('--val-id-path', type=str, default=None)
 parser.add_argument('--save-path', type=str, required=True)
+parser.add_argument('--save-interval', type=int, default=0,
+                    help='save an extra checkpoint every N epochs; 0 disables interval checkpoints')
 parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
@@ -107,7 +110,7 @@ def main():
         cfg['dataset'], cfg['data_root'], 'train_l', cfg['crop_size'], args.labeled_id_path, nsample=len(trainset_u.ids)
     )
     valset = SemiDataset(
-        cfg['dataset'], cfg['data_root'], 'val'
+        cfg['dataset'], cfg['data_root'], 'val', id_path=args.val_id_path
     )
     
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
@@ -264,6 +267,8 @@ def main():
                 'best_epoch_ema': best_epoch_ema
             }
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
+            if args.save_interval > 0 and (epoch + 1) % args.save_interval == 0:
+                torch.save(checkpoint, os.path.join(args.save_path, 'epoch_%d.pth' % (epoch + 1)))
             if is_best:
                 torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
 

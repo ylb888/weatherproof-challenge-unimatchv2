@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments/editors
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Training/runtime outputs
+exp/
+output/
+runs/
+wandb/
+work_dirs/
+*.log
+*.log.json
+
+# Weights and large artifacts
+pretrained/
+*.pth
+*.pt
+*.ckpt
+
+# Local data and generated predictions
+data/
+test_predictions*/
+weatherproof_4samples_input_prediction.*

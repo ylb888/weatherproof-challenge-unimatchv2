@@ -22,20 +22,65 @@ class SemiDataset(Dataset):
         if mode == 'train_l' or mode == 'train_u':
             with open(id_path, 'r') as f:
                 self.ids = f.read().splitlines()
+            if name == 'weatherproof' and mode == 'train_l':
+                ids = []
+                for id in self.ids:
+                    sample_id = id
+                    if sample_id.endswith('_degraded.png'):
+                        sample_id = sample_id[:-len('_degraded.png')]
+                    elif sample_id.endswith('_gt-clean.png'):
+                        sample_id = sample_id[:-len('_gt-clean.png')]
+                    ids.append(sample_id)
+                self.ids = ids
             if mode == 'train_l' and nsample is not None and nsample > len(self.ids):
                 self.ids *= math.ceil(nsample / len(self.ids))
                 self.ids = self.ids[:nsample]
         else:
-            with open('splits/%s/val.txt' % name, 'r') as f:
+            split_path = id_path if id_path is not None else 'splits/%s/val.txt' % name
+            with open(split_path, 'r') as f:
                 self.ids = f.read().splitlines()
+
+    def _weatherproof_paths(self, id):
+        if self.mode == 'train_u':
+            img_rel = id if id.endswith('.png') else id + '_degraded.png'
+            return os.path.join(self.root, 'train_scenes', img_rel), None
+
+        if id.endswith('_degraded.png'):
+            sample_id = id[:-len('_degraded.png')]
+        elif id.endswith('_gt-clean.png'):
+            sample_id = id[:-len('_gt-clean.png')]
+        else:
+            sample_id = id
+
+        if self.mode == 'train_l':
+            img_rel = sample_id + '_gt-clean.png'
+        else:
+            img_rel = sample_id + '_degraded.png'
+        mask_rel = sample_id + '_gt-intern.png'
+
+        return (os.path.join(self.root, 'train_scenes', img_rel),
+                os.path.join(self.root, 'train_scenes', mask_rel))
+
+    def _load_weatherproof_mask(self, mask_path):
+        mask = np.array(Image.open(mask_path), dtype=np.uint8)
+        return Image.fromarray(mask)
 
     def __getitem__(self, item):
         id = self.ids[item]
-        img = Image.open(os.path.join(self.root, id.split(' ')[0])).convert('RGB')
-        if self.mode == 'train_u':
-            mask = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.uint8))
+
+        if self.name == 'weatherproof':
+            img_path, mask_path = self._weatherproof_paths(id)
+            img = Image.open(img_path).convert('RGB')
+            if self.mode == 'train_u':
+                mask = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.uint8))
+            else:
+                mask = self._load_weatherproof_mask(mask_path)
         else:
-            mask = Image.fromarray(np.array(Image.open(os.path.join(self.root, id.split(' ')[1])))) 
+            img = Image.open(os.path.join(self.root, id.split(' ')[0])).convert('RGB')
+            if self.mode == 'train_u':
+                mask = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.uint8))
+            else:
+                mask = Image.fromarray(np.array(Image.open(os.path.join(self.root, id.split(' ')[1])))) 
         
         if self.mode == 'val':
             img, mask = normalize(img, mask)

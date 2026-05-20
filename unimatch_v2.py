@@ -3,14 +3,21 @@ from copy import deepcopy
 import logging
 import os
 import pprint
+from pathlib import Path
 
+import distutils.version
+import numpy as np
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
 import yaml
+from PIL import Image
 
 from dataset.semi import SemiDataset
 from model.semseg.dpt import DPT
@@ -25,9 +32,130 @@ parser = argparse.ArgumentParser(description='UniMatch V2: Pushing the Limit of 
 parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--labeled-id-path', type=str, required=True)
 parser.add_argument('--unlabeled-id-path', type=str, required=True)
+parser.add_argument('--val-id-path', type=str, default=None)
+parser.add_argument('--no-val', action='store_true',
+                    help='skip validation during training')
 parser.add_argument('--save-path', type=str, required=True)
+parser.add_argument('--save-interval', type=int, default=0,
+                    help='save an extra checkpoint every N epochs; 0 disables interval checkpoints')
+parser.add_argument('--reference-pred-dir', type=str, default=None,
+                    help='compare EMA predictions on unlabeled images with this prediction directory after each epoch')
+parser.add_argument('--reference-input-dir', type=str, default='data/test_input',
+                    help='image root used for reference prediction comparison')
+parser.add_argument('--reference-id-path', type=str, default=None,
+                    help='image id list used for reference prediction comparison; defaults to unlabeled id path')
+parser.add_argument('--reference-resize-multiple', type=int, default=14)
 parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
+
+
+def prediction_mask_root(path):
+    path = Path(path)
+    if (path / 'mask').is_dir():
+        return path / 'mask'
+    return path
+
+
+def load_reference_masks(path):
+    root = prediction_mask_root(path)
+    masks = {
+        mask.relative_to(root): mask
+        for mask in root.rglob('*.png')
+        if not mask.name.endswith('_color.png')
+    }
+    if not masks:
+        raise FileNotFoundError('No reference masks found under %s' % root)
+    return root, masks
+
+
+def image_rel_from_id(sample_id):
+    return sample_id if Path(sample_id).suffix else sample_id + '_degraded.png'
+
+
+def mask_rel_from_image_rel(image_rel):
+    image_rel = Path(image_rel)
+    if image_rel.name.endswith('_degraded.png'):
+        return image_rel.with_name(image_rel.name.replace('_degraded.png', '_gt-intern.png'))
+    return image_rel.with_name(image_rel.stem + '_gt-intern.png')
+
+
+def resize_to_multiple(image_tensor, multiple):
+    if multiple <= 1:
+        return image_tensor, image_tensor.shape[-2:]
+
+    ori_h, ori_w = image_tensor.shape[-2:]
+    new_h = int(ori_h / multiple + 0.5) * multiple
+    new_w = int(ori_w / multiple + 0.5) * multiple
+    new_h = max(new_h, multiple)
+    new_w = max(new_w, multiple)
+    if (new_h, new_w) == (ori_h, ori_w):
+        return image_tensor, (ori_h, ori_w)
+    return F.interpolate(image_tensor, (new_h, new_w), mode='bilinear', align_corners=True), (ori_h, ori_w)
+
+
+def update_confusion(confusion, pred, target, num_classes, ignore_index=255):
+    valid = target != ignore_index
+    valid &= target >= 0
+    valid &= target < num_classes
+    valid &= pred >= 0
+    valid &= pred < num_classes
+    encoded = num_classes * target[valid].astype(np.int64) + pred[valid].astype(np.int64)
+    confusion += np.bincount(encoded, minlength=num_classes ** 2).reshape(num_classes, num_classes)
+
+
+def compute_iou(confusion):
+    intersection = np.diag(confusion).astype(np.float64)
+    union = confusion.sum(axis=1) + confusion.sum(axis=0) - intersection
+    iou = np.full_like(intersection, np.nan, dtype=np.float64)
+    valid = union > 0
+    iou[valid] = intersection[valid] / union[valid]
+    return iou, np.nanmean(iou)
+
+
+def evaluate_reference_predictions(model, cfg, input_dir, id_path, reference_masks, resize_multiple, logger):
+    model_was_training = model.training
+    model.eval()
+    input_dir = Path(input_dir)
+    normalize = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+    with open(id_path, 'r') as f:
+        ids = [line.strip() for line in f if line.strip()]
+
+    confusion = np.zeros((cfg['nclass'], cfg['nclass']), dtype=np.int64)
+    matched, missing = 0, 0
+    with torch.no_grad():
+        for idx, sample_id in enumerate(ids, start=1):
+            image_rel = image_rel_from_id(sample_id)
+            image_path = input_dir / image_rel
+            mask_rel = mask_rel_from_image_rel(image_rel)
+            reference_path = reference_masks.get(mask_rel)
+            if reference_path is None:
+                missing += 1
+                continue
+
+            image = Image.open(image_path).convert('RGB')
+            image_tensor = normalize(image).unsqueeze(0).cuda()
+            image_tensor, ori_size = resize_to_multiple(image_tensor, resize_multiple)
+            logits = model(image_tensor)
+            if logits.shape[-2:] != ori_size:
+                logits = F.interpolate(logits, ori_size, mode='bilinear', align_corners=True)
+            pred = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+            target = np.array(Image.open(reference_path), dtype=np.uint8)
+            if pred.shape != target.shape:
+                raise ValueError('Shape mismatch for %s: pred %s, reference %s' % (mask_rel, pred.shape, target.shape))
+            update_confusion(confusion, pred, target, cfg['nclass'])
+            matched += 1
+
+            if idx % 500 == 0:
+                logger.info('Reference mIoU inference: %d/%d images processed' % (idx, len(ids)))
+
+    if model_was_training:
+        model.train()
+    iou, miou = compute_iou(confusion)
+    return miou, iou, matched, missing
 
 
 def main():
@@ -47,6 +175,10 @@ def main():
         writer = SummaryWriter(args.save_path)
         
         os.makedirs(args.save_path, exist_ok=True)
+        reference_root, reference_masks = (None, None)
+        if args.reference_pred_dir is not None:
+            reference_root, reference_masks = load_reference_masks(args.reference_pred_dir)
+            logger.info('Reference prediction masks: %s (%d files)\n' % (reference_root, len(reference_masks)))
 
     cudnn.enabled = True
     cudnn.benchmark = True
@@ -105,9 +237,10 @@ def main():
     trainset_l = SemiDataset(
         cfg['dataset'], cfg['data_root'], 'train_l', cfg['crop_size'], args.labeled_id_path, nsample=len(trainset_u.ids)
     )
-    valset = SemiDataset(
-        cfg['dataset'], cfg['data_root'], 'val'
-    )
+    if not args.no_val:
+        valset = SemiDataset(
+            cfg['dataset'], cfg['data_root'], 'val', id_path=args.val_id_path
+        )
     
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainloader_l = DataLoader(
@@ -119,14 +252,16 @@ def main():
         trainset_u, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, sampler=trainsampler_u
     )
     
-    valsampler = torch.utils.data.distributed.DistributedSampler(valset)
-    valloader = DataLoader(
-        valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False, sampler=valsampler
-    )
+    if not args.no_val:
+        valsampler = torch.utils.data.distributed.DistributedSampler(valset)
+        valloader = DataLoader(
+            valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False, sampler=valsampler
+        )
     
     total_iters = len(trainloader_u) * cfg['epochs']
     previous_best, previous_best_ema = 0.0, 0.0
     best_epoch, best_epoch_ema = 0, 0
+    best_reference_miou, best_reference_epoch = 0.0, 0
     epoch = -1
     
     if os.path.exists(os.path.join(args.save_path, 'latest.pth')):
@@ -139,6 +274,8 @@ def main():
         previous_best_ema = checkpoint['previous_best_ema']
         best_epoch = checkpoint['best_epoch']
         best_epoch_ema = checkpoint['best_epoch_ema']
+        best_reference_miou = checkpoint.get('best_reference_miou', 0.0)
+        best_reference_epoch = checkpoint.get('best_reference_epoch', 0)
         
         if rank == 0:
             logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
@@ -236,32 +373,61 @@ def main():
                             '{:.3f}'.format(i, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg, 
                                             total_loss_s.avg, total_mask_ratio.avg))
         
-        eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
-        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
-        mIoU_ema, iou_class_ema = evaluate(model_ema, valloader, eval_mode, cfg, multiplier=14)
-        
-        if rank == 0:
-            for (cls_idx, iou) in enumerate(iou_class):
-                logger.info('***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}, '
-                            'EMA: {:.2f}'.format(cls_idx, CLASSES[cfg['dataset']][cls_idx], iou, iou_class_ema[cls_idx]))
-            logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}, EMA: {:.2f}\n'.format(eval_mode, mIoU, mIoU_ema))
+        is_best, is_best_ema = False, False
+        if not args.no_val:
+            eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
+            mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
+            mIoU_ema, iou_class_ema = evaluate(model_ema, valloader, eval_mode, cfg, multiplier=14)
             
-            writer.add_scalar('eval/mIoU', mIoU, epoch)
-            writer.add_scalar('eval/mIoU_ema', mIoU_ema, epoch)
-            for i, iou in enumerate(iou_class):
-                writer.add_scalar('eval/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou, epoch)
-                writer.add_scalar('eval/%s_IoU_ema' % (CLASSES[cfg['dataset']][i]), iou_class_ema[i], epoch)
+            if rank == 0:
+                for (cls_idx, iou) in enumerate(iou_class):
+                    logger.info('***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}, '
+                                'EMA: {:.2f}'.format(cls_idx, CLASSES[cfg['dataset']][cls_idx], iou, iou_class_ema[cls_idx]))
+                logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}, EMA: {:.2f}\n'.format(eval_mode, mIoU, mIoU_ema))
+                
+                writer.add_scalar('eval/mIoU', mIoU, epoch)
+                writer.add_scalar('eval/mIoU_ema', mIoU_ema, epoch)
+                for i, iou in enumerate(iou_class):
+                    writer.add_scalar('eval/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou, epoch)
+                    writer.add_scalar('eval/%s_IoU_ema' % (CLASSES[cfg['dataset']][i]), iou_class_ema[i], epoch)
 
-        is_best = mIoU >= previous_best
+            is_best = mIoU >= previous_best
+            is_best_ema = mIoU_ema >= previous_best_ema
+            
+            previous_best = max(mIoU, previous_best)
+            previous_best_ema = max(mIoU_ema, previous_best_ema)
+            if mIoU == previous_best:
+                best_epoch = epoch
+            if mIoU_ema == previous_best_ema:
+                best_epoch_ema = epoch
+        elif rank == 0:
+            logger.info('***** Validation skipped *****\n')
         
-        previous_best = max(mIoU, previous_best)
-        previous_best_ema = max(mIoU_ema, previous_best_ema)
-        if mIoU == previous_best:
-            best_epoch = epoch
-        if mIoU_ema == previous_best_ema:
-            best_epoch_ema = epoch
-        
+        reference_miou, reference_iou = None, None
+        is_best_reference = False
         if rank == 0:
+            if args.reference_pred_dir is not None:
+                eval_model = model_ema.module if hasattr(model_ema, 'module') else model_ema
+                reference_id_path = args.reference_id_path or args.unlabeled_id_path
+                reference_miou, reference_iou, reference_matched, reference_missing = evaluate_reference_predictions(
+                    eval_model, cfg, args.reference_input_dir, reference_id_path,
+                    reference_masks, args.reference_resize_multiple, logger
+                )
+                is_best_reference = reference_miou >= best_reference_miou
+                if is_best_reference:
+                    best_reference_miou = reference_miou
+                    best_reference_epoch = epoch
+                logger.info(
+                    '***** Reference Prediction Comparison ***** >>>> '
+                    'mIoU: %.4f, Best: %.4f @epoch-%d, matched: %d, missing: %d\n'
+                    % (reference_miou * 100, best_reference_miou * 100, best_reference_epoch,
+                       reference_matched, reference_missing)
+                )
+                writer.add_scalar('reference/mIoU', reference_miou * 100, epoch)
+                for i, iou in enumerate(reference_iou):
+                    if not np.isnan(iou):
+                        writer.add_scalar('reference/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou * 100, epoch)
+
             checkpoint = {
                 'model': model.state_dict(),
                 'model_ema': model_ema.state_dict(),
@@ -270,11 +436,21 @@ def main():
                 'previous_best': previous_best,
                 'previous_best_ema': previous_best_ema,
                 'best_epoch': best_epoch,
-                'best_epoch_ema': best_epoch_ema
+                'best_epoch_ema': best_epoch_ema,
+                'best_reference_miou': best_reference_miou,
+                'best_reference_epoch': best_reference_epoch,
             }
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
+            if args.save_interval > 0 and (epoch + 1) % args.save_interval == 0:
+                torch.save(checkpoint, os.path.join(args.save_path, 'epoch_%d.pth' % (epoch + 1)))
             if is_best:
                 torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
+            if is_best_ema:
+                torch.save(checkpoint, os.path.join(args.save_path, 'best_ema.pth'))
+            if is_best_reference:
+                torch.save(checkpoint, os.path.join(args.save_path, 'best_reference_miou.pth'))
+
+        dist.barrier()
 
 
 if __name__ == '__main__':
